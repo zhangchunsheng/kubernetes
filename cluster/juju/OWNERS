@@ -1,17 +1,16 @@
+# See the OWNERS docs at https://go.k8s.io/owners
+
 approvers:
-- castrojo
-- chuckbutler
-- marcoceppi
-- mbruzek
+- Cynerva
+- ktsakalozos
 reviewers:
 - thockin
 - mikedanese
-- nikhiljindal
-- pmorie
 - eparis
 - jlowdermilk
-- jsafrane
-- spxtr
-- krousey
 - david-mcmahon
-- ivan4th
+- Cynerva
+- wwwtyro
+- tvansteenburgh
+- ktsakalozos
+

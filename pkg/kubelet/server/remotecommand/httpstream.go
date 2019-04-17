@@ -24,16 +24,17 @@ import (
 	"net/http"
 	"time"
 
-	"k8s.io/kubernetes/pkg/api"
-	apierrors "k8s.io/kubernetes/pkg/api/errors"
-	metav1 "k8s.io/kubernetes/pkg/apis/meta/v1"
-	"k8s.io/kubernetes/pkg/util/httpstream"
-	"k8s.io/kubernetes/pkg/util/httpstream/spdy"
-	"k8s.io/kubernetes/pkg/util/runtime"
-	"k8s.io/kubernetes/pkg/util/term"
-	"k8s.io/kubernetes/pkg/util/wsstream"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/httpstream"
+	"k8s.io/apimachinery/pkg/util/httpstream/spdy"
+	remotecommandconsts "k8s.io/apimachinery/pkg/util/remotecommand"
+	"k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apiserver/pkg/util/wsstream"
+	"k8s.io/client-go/tools/remotecommand"
+	api "k8s.io/kubernetes/pkg/apis/core"
 
-	"github.com/golang/glog"
+	"k8s.io/klog"
 )
 
 // Options contains details about which streams are required for
@@ -53,7 +54,7 @@ func NewOptions(req *http.Request) (*Options, error) {
 	stderr := req.FormValue(api.ExecStderrParam) == "1"
 	if tty && stderr {
 		// TODO: make this an error before we reach this method
-		glog.V(4).Infof("Access to exec with tty and stderr is not supported, bypassing stderr")
+		klog.V(4).Infof("Access to exec with tty and stderr is not supported, bypassing stderr")
 		stderr = false
 	}
 
@@ -78,7 +79,7 @@ type context struct {
 	stderrStream io.WriteCloser
 	writeStatus  func(status *apierrors.StatusError) error
 	resizeStream io.ReadCloser
-	resizeChan   chan term.Size
+	resizeChan   chan remotecommand.TerminalSize
 	tty          bool
 }
 
@@ -107,25 +108,24 @@ func createStreams(req *http.Request, w http.ResponseWriter, opts *Options, supp
 	if wsstream.IsWebSocketRequest(req) {
 		ctx, ok = createWebSocketStreams(req, w, opts, idleTimeout)
 	} else {
-		ctx, ok = createHttpStreamStreams(req, w, opts, supportedStreamProtocols, idleTimeout, streamCreationTimeout)
+		ctx, ok = createHTTPStreamStreams(req, w, opts, supportedStreamProtocols, idleTimeout, streamCreationTimeout)
 	}
 	if !ok {
 		return nil, false
 	}
 
 	if ctx.resizeStream != nil {
-		ctx.resizeChan = make(chan term.Size)
+		ctx.resizeChan = make(chan remotecommand.TerminalSize)
 		go handleResizeEvents(ctx.resizeStream, ctx.resizeChan)
 	}
 
 	return ctx, true
 }
 
-func createHttpStreamStreams(req *http.Request, w http.ResponseWriter, opts *Options, supportedStreamProtocols []string, idleTimeout, streamCreationTimeout time.Duration) (*context, bool) {
+func createHTTPStreamStreams(req *http.Request, w http.ResponseWriter, opts *Options, supportedStreamProtocols []string, idleTimeout, streamCreationTimeout time.Duration) (*context, bool) {
 	protocol, err := httpstream.Handshake(req, w, supportedStreamProtocols)
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, err.Error())
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return nil, false
 	}
 
@@ -148,16 +148,16 @@ func createHttpStreamStreams(req *http.Request, w http.ResponseWriter, opts *Opt
 
 	var handler protocolHandler
 	switch protocol {
-	case StreamProtocolV4Name:
+	case remotecommandconsts.StreamProtocolV4Name:
 		handler = &v4ProtocolHandler{}
-	case StreamProtocolV3Name:
+	case remotecommandconsts.StreamProtocolV3Name:
 		handler = &v3ProtocolHandler{}
-	case StreamProtocolV2Name:
+	case remotecommandconsts.StreamProtocolV2Name:
 		handler = &v2ProtocolHandler{}
 	case "":
-		glog.V(4).Infof("Client did not request protocol negotiaion. Falling back to %q", StreamProtocolV1Name)
+		klog.V(4).Infof("Client did not request protocol negotiation. Falling back to %q", remotecommandconsts.StreamProtocolV1Name)
 		fallthrough
-	case StreamProtocolV1Name:
+	case remotecommandconsts.StreamProtocolV1Name:
 		handler = &v1ProtocolHandler{}
 	}
 
@@ -409,12 +409,12 @@ WaitForStreams:
 // supportsTerminalResizing returns false because v1ProtocolHandler doesn't support it.
 func (*v1ProtocolHandler) supportsTerminalResizing() bool { return false }
 
-func handleResizeEvents(stream io.Reader, channel chan<- term.Size) {
+func handleResizeEvents(stream io.Reader, channel chan<- remotecommand.TerminalSize) {
 	defer runtime.HandleCrash()
 
 	decoder := json.NewDecoder(stream)
 	for {
-		size := term.Size{}
+		size := remotecommand.TerminalSize{}
 		if err := decoder.Decode(&size); err != nil {
 			break
 		}
@@ -422,7 +422,7 @@ func handleResizeEvents(stream io.Reader, channel chan<- term.Size) {
 	}
 }
 
-func v1WriteStatusFunc(stream io.WriteCloser) func(status *apierrors.StatusError) error {
+func v1WriteStatusFunc(stream io.Writer) func(status *apierrors.StatusError) error {
 	return func(status *apierrors.StatusError) error {
 		if status.Status().Status == metav1.StatusSuccess {
 			return nil // send error messages
@@ -434,7 +434,7 @@ func v1WriteStatusFunc(stream io.WriteCloser) func(status *apierrors.StatusError
 
 // v4WriteStatusFunc returns a WriteStatusFunc that marshals a given api Status
 // as json in the error channel.
-func v4WriteStatusFunc(stream io.WriteCloser) func(status *apierrors.StatusError) error {
+func v4WriteStatusFunc(stream io.Writer) func(status *apierrors.StatusError) error {
 	return func(status *apierrors.StatusError) error {
 		bs, err := json.Marshal(status.Status())
 		if err != nil {

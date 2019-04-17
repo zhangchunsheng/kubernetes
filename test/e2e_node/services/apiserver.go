@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net"
 
+	"k8s.io/apiserver/pkg/storage/storagebackend"
 	apiserver "k8s.io/kubernetes/cmd/kube-apiserver/app"
 	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
 )
@@ -31,29 +32,42 @@ const (
 )
 
 // APIServer is a server which manages apiserver.
-type APIServer struct{}
+type APIServer struct {
+	storageConfig storagebackend.Config
+	stopCh        chan struct{}
+}
 
 // NewAPIServer creates an apiserver.
-func NewAPIServer() *APIServer {
-	return &APIServer{}
+func NewAPIServer(storageConfig storagebackend.Config) *APIServer {
+	return &APIServer{
+		storageConfig: storageConfig,
+		stopCh:        make(chan struct{}),
+	}
 }
 
 // Start starts the apiserver, returns when apiserver is ready.
 func (a *APIServer) Start() error {
-	config := options.NewServerRunOptions()
-	config.Etcd.StorageConfig.ServerList = []string{getEtcdClientURL()}
+	o := options.NewServerRunOptions()
+	o.Etcd.StorageConfig = a.storageConfig
 	_, ipnet, err := net.ParseCIDR(clusterIPRange)
 	if err != nil {
 		return err
 	}
-	config.ServiceClusterIPRange = *ipnet
-	config.AllowPrivileged = true
+	o.ServiceClusterIPRange = *ipnet
+	o.AllowPrivileged = true
+	o.Admission.GenericAdmission.DisablePlugins = []string{"ServiceAccount", "TaintNodesByCondition"}
 	errCh := make(chan error)
 	go func() {
 		defer close(errCh)
-		err := apiserver.Run(config)
+		completedOptions, err := apiserver.Complete(o)
+		if err != nil {
+			errCh <- fmt.Errorf("set apiserver default options error: %v", err)
+			return
+		}
+		err = apiserver.Run(completedOptions, a.stopCh)
 		if err != nil {
 			errCh <- fmt.Errorf("run apiserver error: %v", err)
+			return
 		}
 	}()
 
@@ -67,6 +81,10 @@ func (a *APIServer) Start() error {
 // Stop stops the apiserver. Currently, there is no way to stop the apiserver.
 // The function is here only for completion.
 func (a *APIServer) Stop() error {
+	if a.stopCh != nil {
+		close(a.stopCh)
+		a.stopCh = nil
+	}
 	return nil
 }
 

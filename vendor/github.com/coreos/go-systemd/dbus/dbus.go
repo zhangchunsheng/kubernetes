@@ -16,6 +16,7 @@
 package dbus
 
 import (
+	"encoding/hex"
 	"fmt"
 	"os"
 	"strconv"
@@ -60,6 +61,27 @@ func PathBusEscape(path string) string {
 	return string(n)
 }
 
+// pathBusUnescape is the inverse of PathBusEscape.
+func pathBusUnescape(path string) string {
+	if path == "_" {
+		return ""
+	}
+	n := []byte{}
+	for i := 0; i < len(path); i++ {
+		c := path[i]
+		if c == '_' && i+2 < len(path) {
+			res, err := hex.DecodeString(path[i+1 : i+3])
+			if err == nil {
+				n = append(n, res...)
+			}
+			i += 2
+		} else {
+			n = append(n, c)
+		}
+	}
+	return string(n)
+}
+
 // Conn is a connection to systemd's dbus endpoint.
 type Conn struct {
 	// sysconn/sysobj are only used to call dbus methods
@@ -74,18 +96,33 @@ type Conn struct {
 		jobs map[dbus.ObjectPath]chan<- string
 		sync.Mutex
 	}
-	subscriber struct {
+	subStateSubscriber struct {
 		updateCh chan<- *SubStateUpdate
 		errCh    chan<- error
 		sync.Mutex
 		ignore      map[dbus.ObjectPath]int64
 		cleanIgnore int64
 	}
+	propertiesSubscriber struct {
+		updateCh chan<- *PropertiesUpdate
+		errCh    chan<- error
+		sync.Mutex
+	}
 }
 
-// New establishes a connection to the system bus and authenticates.
+// New establishes a connection to any available bus and authenticates.
 // Callers should call Close() when done with the connection.
 func New() (*Conn, error) {
+	conn, err := NewSystemConnection()
+	if err != nil && os.Geteuid() == 0 {
+		return NewSystemdConnection()
+	}
+	return conn, err
+}
+
+// NewSystemConnection establishes a connection to the system bus and authenticates.
+// Callers should call Close() when done with the connection
+func NewSystemConnection() (*Conn, error) {
 	return NewConnection(func() (*dbus.Conn, error) {
 		return dbusAuthHelloConnection(dbus.SystemBusPrivate)
 	})
@@ -142,7 +179,7 @@ func NewConnection(dialBus func() (*dbus.Conn, error)) (*Conn, error) {
 		sigobj:  systemdObject(sigconn),
 	}
 
-	c.subscriber.ignore = make(map[dbus.ObjectPath]int64)
+	c.subStateSubscriber.ignore = make(map[dbus.ObjectPath]int64)
 	c.jobListener.jobs = make(map[dbus.ObjectPath]chan<- string)
 
 	// Setup the listeners on jobs so that we can get completions

@@ -1,4 +1,4 @@
-# Copyright 2016 The Kubernetes Authors.
+# Copyright 2017 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,20 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-.PHONY:	elasticsearch_logging_discovery build push
+.PHONY:	build
 
-# The current value of the tag to be used for building and
-# pushing an image to gcr.io
-TAG = v2.4.1
+PREFIX = gcr.io/fluentd-elasticsearch
+IMAGE = elasticsearch
+TAG = v6.6.1
 
-build:	elasticsearch_logging_discovery
-	docker build -t gcr.io/google_containers/elasticsearch:$(TAG) .
-
-push:
-	gcloud docker -- push gcr.io/google_containers/elasticsearch:$(TAG)
-
-elasticsearch_logging_discovery:
-	go build -a -ldflags "-w" elasticsearch_logging_discovery.go
-
-clean:
-	rm elasticsearch_logging_discovery
+build:
+	gcloud builds submit --tag ${PREFIX}/${IMAGE}:${TAG}

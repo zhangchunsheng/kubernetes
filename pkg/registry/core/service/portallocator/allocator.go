@@ -20,11 +20,11 @@ import (
 	"errors"
 	"fmt"
 
-	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/apimachinery/pkg/util/net"
+	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/registry/core/service/allocator"
-	"k8s.io/kubernetes/pkg/util/net"
 
-	"github.com/golang/glog"
+	"k8s.io/klog"
 )
 
 // Interface manages the allocation of ports out of a range. Interface
@@ -34,6 +34,9 @@ type Interface interface {
 	AllocateNext() (int, error)
 	Release(int) error
 	ForEach(func(int))
+
+	// For testing
+	Has(int) bool
 }
 
 var (
@@ -71,7 +74,7 @@ func NewPortAllocatorCustom(pr net.PortRange, allocatorFactory allocator.Allocat
 	return a
 }
 
-// Helper that wraps NewAllocatorCIDRRange, for creating a range backed by an in-memory store.
+// Helper that wraps NewPortAllocatorCustom, for creating a range backed by an in-memory store.
 func NewPortAllocator(pr net.PortRange) *PortAllocator {
 	return NewPortAllocatorCustom(pr, func(max int, rangeSpec string) allocator.Interface {
 		return allocator.NewAllocationMap(max, rangeSpec)
@@ -149,7 +152,7 @@ func (r *PortAllocator) ForEach(fn func(int)) {
 func (r *PortAllocator) Release(port int) error {
 	ok, offset := r.contains(port)
 	if !ok {
-		glog.Warningf("port is not in the range when release it. port: %v", port)
+		klog.Warningf("port is not in the range when release it. port: %v", port)
 		return nil
 	}
 

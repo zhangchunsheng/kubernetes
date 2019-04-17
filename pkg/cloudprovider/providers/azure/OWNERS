@@ -1,3 +1,15 @@
-assignees:
-  - colemickens
-  - brendandburns
+# See the OWNERS docs at https://go.k8s.io/owners
+
+approvers:
+- andyzhangx
+- brendandburns
+- feiskyer
+- karataliu
+- khenidak
+reviewers:
+- andyzhangx
+- brendandburns
+- feiskyer
+- justaugustus
+- karataliu
+- khenidak

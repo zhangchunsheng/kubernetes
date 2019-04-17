@@ -18,20 +18,22 @@ package kubelet
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/golang/glog"
-	"k8s.io/kubernetes/pkg/api/v1"
-	"k8s.io/kubernetes/pkg/client/record"
+	"k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/klog"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/events"
 	"k8s.io/kubernetes/pkg/kubelet/eviction"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
+	"k8s.io/kubernetes/pkg/kubelet/util/format"
 	"k8s.io/kubernetes/pkg/kubelet/util/queue"
-	"k8s.io/kubernetes/pkg/types"
-	"k8s.io/kubernetes/pkg/util/runtime"
-	"k8s.io/kubernetes/pkg/util/wait"
 )
 
 // OnCompleteFunc is a function that is invoked when an operation completes.
@@ -95,8 +97,11 @@ const (
 	// jitter factor for resyncInterval
 	workerResyncIntervalJitterFactor = 0.5
 
-	// jitter factor for backOffPeriod
+	// jitter factor for backOffPeriod and backOffOnTransientErrorPeriod
 	workerBackOffPeriodJitterFactor = 0.5
+
+	// backoff period when transient error occurred.
+	backOffOnTransientErrorPeriod = time.Second
 )
 
 type podWorkers struct {
@@ -161,6 +166,9 @@ func (p *podWorkers) managePodLoop(podUpdates <-chan UpdatePodOptions) {
 			// the previous sync.
 			status, err := p.podCache.GetNewerThan(podUID, lastSyncTime)
 			if err != nil {
+				// This is the legacy event thrown by manage pod loop
+				// all other events are now dispatched from syncPodFn
+				p.recorder.Eventf(update.Pod, v1.EventTypeWarning, events.FailedSync, "error determining status: %v", err)
 				return err
 			}
 			err = p.syncPodFn(syncPodOptions{
@@ -171,18 +179,15 @@ func (p *podWorkers) managePodLoop(podUpdates <-chan UpdatePodOptions) {
 				updateType:     update.UpdateType,
 			})
 			lastSyncTime = time.Now()
-			if err != nil {
-				return err
-			}
-			return nil
+			return err
 		}()
 		// notify the call-back function if the operation succeeded or not
 		if update.OnCompleteFunc != nil {
 			update.OnCompleteFunc(err)
 		}
 		if err != nil {
-			glog.Errorf("Error syncing pod %s, skipping: %v", update.Pod.UID, err)
-			p.recorder.Eventf(update.Pod, v1.EventTypeWarning, events.FailedSync, "Error syncing pod, skipping: %v", err)
+			// IMPORTANT: we do not log errors here, the syncPodFn is responsible for logging errors
+			klog.Errorf("Error syncing pod %s (%q), skipping: %v", update.Pod.UID, format.Pod(update.Pod), err)
 		}
 		p.wrapUp(update.Pod.UID, err)
 	}
@@ -234,7 +239,7 @@ func (p *podWorkers) removeWorker(uid types.UID) {
 		delete(p.podUpdates, uid)
 		// If there is an undelivered work update for this pod we need to remove it
 		// since per-pod goroutine won't be able to put it to the already closed
-		// channel when it finish processing the current work update.
+		// channel when it finishes processing the current work update.
 		if _, cached := p.lastUndeliveredWorkUpdate[uid]; cached {
 			delete(p.lastUndeliveredWorkUpdate, uid)
 		}
@@ -262,6 +267,9 @@ func (p *podWorkers) wrapUp(uid types.UID, syncErr error) {
 	case syncErr == nil:
 		// No error; requeue at the regular resync interval.
 		p.workQueue.Enqueue(uid, wait.Jitter(p.resyncInterval, workerResyncIntervalJitterFactor))
+	case strings.Contains(syncErr.Error(), NetworkNotReadyErrorMsg):
+		// Network is not ready; back off for short period of time and retry as network might be ready soon.
+		p.workQueue.Enqueue(uid, wait.Jitter(backOffOnTransientErrorPeriod, workerBackOffPeriodJitterFactor))
 	default:
 		// Error occurred during the sync; back off and then retry.
 		p.workQueue.Enqueue(uid, wait.Jitter(p.backOffPeriod, workerBackOffPeriodJitterFactor))
@@ -293,9 +301,9 @@ func killPodNow(podWorkers PodWorkers, recorder record.EventRecorder) eviction.K
 		}
 
 		// we timeout and return an error if we don't get a callback within a reasonable time.
-		// the default timeout is relative to the grace period (we settle on 2s to wait for kubelet->runtime traffic to complete in sigkill)
+		// the default timeout is relative to the grace period (we settle on 10s to wait for kubelet->runtime traffic to complete in sigkill)
 		timeout := int64(gracePeriod + (gracePeriod / 2))
-		minTimeout := int64(2)
+		minTimeout := int64(10)
 		if timeout < minTimeout {
 			timeout = minTimeout
 		}
@@ -305,7 +313,7 @@ func killPodNow(podWorkers PodWorkers, recorder record.EventRecorder) eviction.K
 		type response struct {
 			err error
 		}
-		ch := make(chan response)
+		ch := make(chan response, 1)
 		podWorkers.UpdatePod(&UpdatePodOptions{
 			Pod:        pod,
 			UpdateType: kubetypes.SyncPodKill,

@@ -18,73 +18,46 @@ package e2e
 
 import (
 	"fmt"
+	"io/ioutil"
 	"os"
 	"path"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/golang/glog"
 	"github.com/onsi/ginkgo"
 	"github.com/onsi/ginkgo/config"
 	"github.com/onsi/ginkgo/reporters"
 	"github.com/onsi/gomega"
+	"k8s.io/klog"
 
-	federationapi "k8s.io/kubernetes/federation/apis/federation/v1beta1"
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/v1"
-	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/clientset"
-	gcecloud "k8s.io/kubernetes/pkg/cloudprovider/providers/gce"
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/util/logs"
-	runtimeutils "k8s.io/kubernetes/pkg/util/runtime"
-	utilyaml "k8s.io/kubernetes/pkg/util/yaml"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	runtimeutils "k8s.io/apimachinery/pkg/util/runtime"
+	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/component-base/logs"
+	"k8s.io/kubernetes/pkg/version"
 	commontest "k8s.io/kubernetes/test/e2e/common"
 	"k8s.io/kubernetes/test/e2e/framework"
-	"k8s.io/kubernetes/test/e2e/generated"
+	"k8s.io/kubernetes/test/e2e/framework/ginkgowrapper"
+	"k8s.io/kubernetes/test/e2e/framework/metrics"
+	"k8s.io/kubernetes/test/e2e/manifest"
 	testutils "k8s.io/kubernetes/test/utils"
-)
 
-const (
-	// imagePrePullingTimeout is the time we wait for the e2e-image-puller
-	// static pods to pull the list of seeded images. If they don't pull
-	// images within this time we simply log their output and carry on
-	// with the tests.
-	imagePrePullingTimeout = 5 * time.Minute
+	// ensure auth plugins are loaded
+	_ "k8s.io/client-go/plugin/pkg/client/auth"
+
+	// ensure that cloud providers are loaded
+	_ "k8s.io/kubernetes/test/e2e/framework/providers/aws"
+	_ "k8s.io/kubernetes/test/e2e/framework/providers/azure"
+	_ "k8s.io/kubernetes/test/e2e/framework/providers/gce"
+	_ "k8s.io/kubernetes/test/e2e/framework/providers/kubemark"
+	_ "k8s.io/kubernetes/test/e2e/framework/providers/openstack"
+	_ "k8s.io/kubernetes/test/e2e/framework/providers/vsphere"
 )
 
 var (
-	cloudConfig = &framework.TestContext.CloudConfig
+	cloudConfig      = &framework.TestContext.CloudConfig
+	nodeKillerStopCh = make(chan struct{})
 )
-
-// setupProviderConfig validates and sets up cloudConfig based on framework.TestContext.Provider.
-func setupProviderConfig() error {
-	switch framework.TestContext.Provider {
-	case "":
-		glog.Info("The --provider flag is not set.  Treating as a conformance test.  Some tests may not be run.")
-
-	case "gce", "gke":
-		var err error
-		framework.Logf("Fetching cloud provider for %q\r\n", framework.TestContext.Provider)
-		zone := framework.TestContext.CloudConfig.Zone
-		region, err := gcecloud.GetGCERegion(zone)
-		if err != nil {
-			return fmt.Errorf("error parsing GCE/GKE region from zone %q: %v", zone, err)
-		}
-		managedZones := []string{zone} // Only single-zone for now
-		cloudConfig.Provider, err = gcecloud.CreateGCECloud(framework.TestContext.CloudConfig.ProjectID, region, zone, managedZones, "" /* networkUrl */, nil /* nodeTags */, "" /* nodeInstancePerfix */, nil /* tokenSource */, false /* useMetadataServer */)
-		if err != nil {
-			return fmt.Errorf("Error building GCE/GKE provider: %v", err)
-		}
-
-	case "aws":
-		if cloudConfig.Zone == "" {
-			return fmt.Errorf("gce-zone must be specified for AWS")
-		}
-	}
-
-	return nil
-}
 
 // There are certain operations we only want to run once per overall test invocation
 // (such as deleting old namespaces, or verifying that all system pods are running.
@@ -97,23 +70,29 @@ func setupProviderConfig() error {
 var _ = ginkgo.SynchronizedBeforeSuite(func() []byte {
 	// Run only on Ginkgo node 1
 
-	if err := setupProviderConfig(); err != nil {
-		framework.Failf("Failed to setup provider config: %v", err)
+	switch framework.TestContext.Provider {
+	case "gce", "gke":
+		framework.LogClusterImageSources()
 	}
 
 	c, err := framework.LoadClientset()
 	if err != nil {
-		glog.Fatal("Error loading client: ", err)
+		klog.Fatal("Error loading client: ", err)
 	}
 
-	// Delete any namespaces except default and kube-system. This ensures no
+	// Delete any namespaces except those created by the system. This ensures no
 	// lingering resources are left over from a previous test run.
 	if framework.TestContext.CleanStart {
-		deleted, err := framework.DeleteNamespaces(c, nil /* deleteFilter */, []string{api.NamespaceSystem, v1.NamespaceDefault, federationapi.FederationNamespaceSystem})
+		deleted, err := framework.DeleteNamespaces(c, nil, /* deleteFilter */
+			[]string{
+				metav1.NamespaceSystem,
+				metav1.NamespaceDefault,
+				metav1.NamespacePublic,
+			})
 		if err != nil {
 			framework.Failf("Error deleting orphaned namespaces: %v", err)
 		}
-		glog.Infof("Waiting for deletion of the following namespaces: %v", deleted)
+		klog.Infof("Waiting for deletion of the following namespaces: %v", deleted)
 		if err := framework.WaitForNamespacesDeleted(c, deleted, framework.NamespaceCleanupTimeout); err != nil {
 			framework.Failf("Failed to delete orphaned namespaces %v: %v", deleted, err)
 		}
@@ -124,103 +103,114 @@ var _ = ginkgo.SynchronizedBeforeSuite(func() []byte {
 	// unschedulable, we need to wait until all of them are schedulable.
 	framework.ExpectNoError(framework.WaitForAllNodesSchedulable(c, framework.TestContext.NodeSchedulableTimeout))
 
+	// If NumNodes is not specified then auto-detect how many are scheduleable and not tainted
+	if framework.TestContext.CloudConfig.NumNodes == framework.DefaultNumNodes {
+		framework.TestContext.CloudConfig.NumNodes = len(framework.GetReadySchedulableNodesOrDie(c).Items)
+	}
+
 	// Ensure all pods are running and ready before starting tests (otherwise,
 	// cluster infrastructure pods that are being pulled or started can block
 	// test pods from running, and tests that ensure all pods are running and
 	// ready will fail).
 	podStartupTimeout := framework.TestContext.SystemPodsStartupTimeout
-	if err := framework.WaitForPodsRunningReady(c, api.NamespaceSystem, int32(framework.TestContext.MinStartupPods), podStartupTimeout, framework.ImagePullerLabels, true); err != nil {
-		framework.DumpAllNamespaceInfo(c, api.NamespaceSystem)
-		framework.LogFailedContainers(c, api.NamespaceSystem, framework.Logf)
-		runKubernetesServiceTestContainer(c, v1.NamespaceDefault)
+	// TODO: In large clusters, we often observe a non-starting pods due to
+	// #41007. To avoid those pods preventing the whole test runs (and just
+	// wasting the whole run), we allow for some not-ready pods (with the
+	// number equal to the number of allowed not-ready nodes).
+	if err := framework.WaitForPodsRunningReady(c, metav1.NamespaceSystem, int32(framework.TestContext.MinStartupPods), int32(framework.TestContext.AllowedNotReadyNodes), podStartupTimeout, map[string]string{}); err != nil {
+		framework.DumpAllNamespaceInfo(c, metav1.NamespaceSystem)
+		framework.LogFailedContainers(c, metav1.NamespaceSystem, framework.Logf)
+		runKubernetesServiceTestContainer(c, metav1.NamespaceDefault)
 		framework.Failf("Error waiting for all pods to be running and ready: %v", err)
 	}
 
-	if err := framework.WaitForPodsSuccess(c, api.NamespaceSystem, framework.ImagePullerLabels, imagePrePullingTimeout); err != nil {
-		// There is no guarantee that the image pulling will succeed in 3 minutes
-		// and we don't even run the image puller on all platforms (including GKE).
-		// We wait for it so we get an indication of failures in the logs, and to
-		// maximize benefit of image pre-pulling.
-		framework.Logf("WARNING: Image pulling pods failed to enter success in %v: %v", imagePrePullingTimeout, err)
+	if err := framework.WaitForDaemonSets(c, metav1.NamespaceSystem, int32(framework.TestContext.AllowedNotReadyNodes), framework.TestContext.SystemDaemonsetStartupTimeout); err != nil {
+		framework.Logf("WARNING: Waiting for all daemonsets to be ready failed: %v", err)
 	}
 
-	// Dump the output of the nethealth containers only once per run
-	if framework.TestContext.DumpLogsOnFailure {
-		framework.Logf("Dumping network health container logs from all nodes")
-		framework.LogContainersInPodsWithLabels(c, api.NamespaceSystem, framework.ImagePullerLabels, "nethealth", framework.Logf)
+	// Log the version of the server and this client.
+	framework.Logf("e2e test version: %s", version.Get().GitVersion)
+
+	dc := c.DiscoveryClient
+
+	serverVersion, serverErr := dc.ServerVersion()
+	if serverErr != nil {
+		framework.Logf("Unexpected server error retrieving version: %v", serverErr)
+	}
+	if serverVersion != nil {
+		framework.Logf("kube-apiserver version: %s", serverVersion.GitVersion)
 	}
 
 	// Reference common test to make the import valid.
 	commontest.CurrentSuite = commontest.E2E
 
+	if framework.TestContext.NodeKiller.Enabled {
+		nodeKiller := framework.NewNodeKiller(framework.TestContext.NodeKiller, c, framework.TestContext.Provider)
+		nodeKillerStopCh = make(chan struct{})
+		go nodeKiller.Run(nodeKillerStopCh)
+	}
 	return nil
 
 }, func(data []byte) {
 	// Run on all Ginkgo nodes
-
-	if cloudConfig.Provider == nil {
-		if err := setupProviderConfig(); err != nil {
-			framework.Failf("Failed to setup provider config: %v", err)
-		}
-	}
 })
 
-type CleanupActionHandle *int
-
-var cleanupActionsLock sync.Mutex
-var cleanupActions = map[CleanupActionHandle]func(){}
-
-// AddCleanupAction installs a function that will be called in the event of the
-// whole test being terminated.  This allows arbitrary pieces of the overall
-// test to hook into SynchronizedAfterSuite().
-func AddCleanupAction(fn func()) CleanupActionHandle {
-	p := CleanupActionHandle(new(int))
-	cleanupActionsLock.Lock()
-	defer cleanupActionsLock.Unlock()
-	cleanupActions[p] = fn
-	return p
-}
-
-// RemoveCleanupAction removes a function that was installed by
-// AddCleanupAction.
-func RemoveCleanupAction(p CleanupActionHandle) {
-	cleanupActionsLock.Lock()
-	defer cleanupActionsLock.Unlock()
-	delete(cleanupActions, p)
-}
-
-// RunCleanupActions runs all functions installed by AddCleanupAction.  It does
-// not remove them (see RemoveCleanupAction) but it does run unlocked, so they
-// may remove themselves.
-func RunCleanupActions() {
-	list := []func(){}
-	func() {
-		cleanupActionsLock.Lock()
-		defer cleanupActionsLock.Unlock()
-		for _, fn := range cleanupActions {
-			list = append(list, fn)
-		}
-	}()
-	// Run unlocked.
-	for _, fn := range list {
-		fn()
-	}
-}
-
-// Similar to SynchornizedBeforeSuite, we want to run some operations only once (such as collecting cluster logs).
+// Similar to SynchronizedBeforeSuite, we want to run some operations only once (such as collecting cluster logs).
 // Here, the order of functions is reversed; first, the function which runs everywhere,
 // and then the function that only runs on the first Ginkgo node.
 var _ = ginkgo.SynchronizedAfterSuite(func() {
 	// Run on all Ginkgo nodes
-	RunCleanupActions()
+	framework.Logf("Running AfterSuite actions on all nodes")
+	framework.RunCleanupActions()
 }, func() {
 	// Run only Ginkgo on node 1
+	framework.Logf("Running AfterSuite actions on node 1")
 	if framework.TestContext.ReportDir != "" {
 		framework.CoreDump(framework.TestContext.ReportDir)
 	}
+	if framework.TestContext.GatherSuiteMetricsAfterTest {
+		if err := gatherTestSuiteMetrics(); err != nil {
+			framework.Logf("Error gathering metrics: %v", err)
+		}
+	}
+	if framework.TestContext.NodeKiller.Enabled {
+		close(nodeKillerStopCh)
+	}
 })
 
-// TestE2E checks configuration parameters (specified through flags) and then runs
+func gatherTestSuiteMetrics() error {
+	framework.Logf("Gathering metrics")
+	c, err := framework.LoadClientset()
+	if err != nil {
+		return fmt.Errorf("error loading client: %v", err)
+	}
+
+	// Grab metrics for apiserver, scheduler, controller-manager, kubelet (for non-kubemark case) and cluster autoscaler (optionally).
+	grabber, err := metrics.NewMetricsGrabber(c, nil, !framework.ProviderIs("kubemark"), true, true, true, framework.TestContext.IncludeClusterAutoscalerMetrics)
+	if err != nil {
+		return fmt.Errorf("failed to create MetricsGrabber: %v", err)
+	}
+
+	received, err := grabber.Grab()
+	if err != nil {
+		return fmt.Errorf("failed to grab metrics: %v", err)
+	}
+
+	metricsForE2E := (*framework.MetricsForE2E)(&received)
+	metricsJSON := metricsForE2E.PrintJSON()
+	if framework.TestContext.ReportDir != "" {
+		filePath := path.Join(framework.TestContext.ReportDir, "MetricsForE2ESuite_"+time.Now().Format(time.RFC3339)+".json")
+		if err := ioutil.WriteFile(filePath, []byte(metricsJSON), 0644); err != nil {
+			return fmt.Errorf("error writing to %q: %v", filePath, err)
+		}
+	} else {
+		framework.Logf("\n\nTest Suite Metrics:\n%s\n", metricsJSON)
+	}
+
+	return nil
+}
+
+// RunE2ETests checks configuration parameters (specified through flags) and then runs
 // E2E tests using the Ginkgo runner.
 // If a "report directory" is specified, one or more JUnit test reports will be
 // generated in this directory, and cluster logs will also be saved.
@@ -230,7 +220,7 @@ func RunE2ETests(t *testing.T) {
 	logs.InitLogs()
 	defer logs.FlushLogs()
 
-	gomega.RegisterFailHandler(ginkgo.Fail)
+	gomega.RegisterFailHandler(ginkgowrapper.Fail)
 	// Disable skipped tests unless they are explicitly requested.
 	if config.GinkgoConfig.FocusString == "" && config.GinkgoConfig.SkipString == "" {
 		config.GinkgoConfig.SkipString = `\[Flaky\]|\[Feature:.+\]`
@@ -242,46 +232,33 @@ func RunE2ETests(t *testing.T) {
 		// TODO: we should probably only be trying to create this directory once
 		// rather than once-per-Ginkgo-node.
 		if err := os.MkdirAll(framework.TestContext.ReportDir, 0755); err != nil {
-			glog.Errorf("Failed creating report directory: %v", err)
+			klog.Errorf("Failed creating report directory: %v", err)
 		} else {
 			r = append(r, reporters.NewJUnitReporter(path.Join(framework.TestContext.ReportDir, fmt.Sprintf("junit_%v%02d.xml", framework.TestContext.ReportPrefix, config.GinkgoConfig.ParallelNode))))
 		}
 	}
-	glog.Infof("Starting e2e run %q on Ginkgo node %d", framework.RunId, config.GinkgoConfig.ParallelNode)
+	klog.Infof("Starting e2e run %q on Ginkgo node %d", framework.RunId, config.GinkgoConfig.ParallelNode)
 
 	ginkgo.RunSpecsWithDefaultAndCustomReporters(t, "Kubernetes e2e suite", r)
-}
-
-func podFromManifest(filename string) (*v1.Pod, error) {
-	var pod v1.Pod
-	framework.Logf("Parsing pod from %v", filename)
-	data := generated.ReadOrDie(filename)
-	json, err := utilyaml.ToJSON(data)
-	if err != nil {
-		return nil, err
-	}
-	if err := runtime.DecodeInto(api.Codecs.UniversalDecoder(), json, &pod); err != nil {
-		return nil, err
-	}
-	return &pod, nil
 }
 
 // Run a test container to try and contact the Kubernetes api-server from a pod, wait for it
 // to flip to Ready, log its output and delete it.
 func runKubernetesServiceTestContainer(c clientset.Interface, ns string) {
 	path := "test/images/clusterapi-tester/pod.yaml"
-	p, err := podFromManifest(path)
+	framework.Logf("Parsing pod from %v", path)
+	p, err := manifest.PodFromManifest(path)
 	if err != nil {
 		framework.Logf("Failed to parse clusterapi-tester from manifest %v: %v", path, err)
 		return
 	}
 	p.Namespace = ns
-	if _, err := c.Core().Pods(ns).Create(p); err != nil {
+	if _, err := c.CoreV1().Pods(ns).Create(p); err != nil {
 		framework.Logf("Failed to create %v: %v", p.Name, err)
 		return
 	}
 	defer func() {
-		if err := c.Core().Pods(ns).Delete(p.Name, nil); err != nil {
+		if err := c.CoreV1().Pods(ns).Delete(p.Name, nil); err != nil {
 			framework.Logf("Failed to delete pod %v: %v", p.Name, err)
 		}
 	}()

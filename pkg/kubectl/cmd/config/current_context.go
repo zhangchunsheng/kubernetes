@@ -22,49 +22,52 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"k8s.io/kubernetes/pkg/client/unversioned/clientcmd"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/templates"
+	"k8s.io/client-go/tools/clientcmd"
 	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
+	"k8s.io/kubernetes/pkg/kubectl/util/i18n"
+	"k8s.io/kubernetes/pkg/kubectl/util/templates"
 )
 
+// CurrentContextOptions holds the command-line options for 'config current-context' sub command
 type CurrentContextOptions struct {
 	ConfigAccess clientcmd.ConfigAccess
 }
 
 var (
-	current_context_long = templates.LongDesc(`
+	currentContextLong = templates.LongDesc(`
 		Displays the current-context`)
 
-	current_context_example = templates.Examples(`
+	currentContextExample = templates.Examples(`
 		# Display the current-context
 		kubectl config current-context`)
 )
 
+// NewCmdConfigCurrentContext returns a Command instance for 'config current-context' sub command
 func NewCmdConfigCurrentContext(out io.Writer, configAccess clientcmd.ConfigAccess) *cobra.Command {
 	options := &CurrentContextOptions{ConfigAccess: configAccess}
 
 	cmd := &cobra.Command{
 		Use:     "current-context",
-		Short:   "Displays the current-context",
-		Long:    current_context_long,
-		Example: current_context_example,
+		Short:   i18n.T("Displays the current-context"),
+		Long:    currentContextLong,
+		Example: currentContextExample,
 		Run: func(cmd *cobra.Command, args []string) {
-			err := RunCurrentContext(out, args, options)
-			cmdutil.CheckErr(err)
+			cmdutil.CheckErr(RunCurrentContext(out, options))
 		},
 	}
 
 	return cmd
 }
 
-func RunCurrentContext(out io.Writer, args []string, options *CurrentContextOptions) error {
+// RunCurrentContext performs the execution of 'config current-context' sub command
+func RunCurrentContext(out io.Writer, options *CurrentContextOptions) error {
 	config, err := options.ConfigAccess.GetStartingConfig()
 	if err != nil {
 		return err
 	}
 
 	if config.CurrentContext == "" {
-		err = fmt.Errorf("current-context is not set\n")
+		err = fmt.Errorf("current-context is not set")
 		return err
 	}
 

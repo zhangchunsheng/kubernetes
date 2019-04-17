@@ -1,4 +1,12 @@
-assignees:
+# See the OWNERS docs at https://go.k8s.io/owners
+
+reviewers:
+  - brendandburns
+  - dchen1107
+  - lavalamp
+  - smarterclayton
+  - thockin
+approvers:
   - brendandburns
   - dchen1107
   - lavalamp

@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"testing"
 
-	"k8s.io/client-go/rest"
+	restclient "k8s.io/client-go/rest"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
 
@@ -38,16 +38,20 @@ func (l *testLoader) Load() (*clientcmdapi.Config, error) {
 }
 
 type testClientConfig struct {
-	config             *rest.Config
+	rawconfig          *clientcmdapi.Config
+	config             *restclient.Config
 	namespace          string
 	namespaceSpecified bool
 	err                error
 }
 
 func (c *testClientConfig) RawConfig() (clientcmdapi.Config, error) {
-	return clientcmdapi.Config{}, fmt.Errorf("unexpected call")
+	if c.rawconfig == nil {
+		return clientcmdapi.Config{}, fmt.Errorf("unexpected call")
+	}
+	return *c.rawconfig, nil
 }
-func (c *testClientConfig) ClientConfig() (*rest.Config, error) {
+func (c *testClientConfig) ClientConfig() (*restclient.Config, error) {
 	return c.config, c.err
 }
 func (c *testClientConfig) Namespace() (string, bool, error) {
@@ -95,7 +99,7 @@ func TestInClusterConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	config2 := &rest.Config{Host: "config2"}
+	config2 := &restclient.Config{Host: "config2"}
 	err1 := fmt.Errorf("unique error")
 
 	testCases := map[string]struct {
@@ -104,7 +108,7 @@ func TestInClusterConfig(t *testing.T) {
 		defaultConfig *DirectClientConfig
 
 		checkedICC bool
-		result     *rest.Config
+		result     *restclient.Config
 		err        error
 	}{
 		"in-cluster checked on other error": {
@@ -224,10 +228,11 @@ func TestInClusterConfigNamespace(t *testing.T) {
 	testCases := map[string]struct {
 		clientConfig *testClientConfig
 		icc          *testICC
+		overrides    *ConfigOverrides
 
 		checkedICC bool
 		result     string
-		ok         bool
+		overridden bool
 		err        error
 	}{
 		"in-cluster checked on empty error": {
@@ -256,8 +261,8 @@ func TestInClusterConfigNamespace(t *testing.T) {
 			clientConfig: &testClientConfig{namespace: "test", namespaceSpecified: true},
 			icc:          &testICC{},
 
-			result: "test",
-			ok:     true,
+			result:     "test",
+			overridden: true,
 		},
 
 		"in-cluster checked when namespace is not specified, but is defaulted": {
@@ -266,7 +271,7 @@ func TestInClusterConfigNamespace(t *testing.T) {
 
 			checkedICC: true,
 			result:     "test",
-			ok:         false,
+			overridden: false,
 		},
 
 		"in-cluster error returned when config is empty": {
@@ -294,7 +299,7 @@ func TestInClusterConfigNamespace(t *testing.T) {
 
 			checkedICC: true,
 			result:     "test",
-			ok:         true,
+			overridden: true,
 		},
 
 		"in-cluster config returned when config is empty and namespace is defaulted but not explicitly set": {
@@ -309,20 +314,41 @@ func TestInClusterConfigNamespace(t *testing.T) {
 
 			checkedICC: true,
 			result:     "test",
-			ok:         false,
+			overridden: false,
+		},
+
+		"overridden context used to verify explicit namespace in config": {
+			clientConfig: &testClientConfig{
+				namespace:          "default",
+				namespaceSpecified: false, // a namespace that comes from a context is not considered overridden
+				rawconfig:          &clientcmdapi.Config{Contexts: map[string]*clientcmdapi.Context{"overridden-context": {Namespace: "default"}}},
+			},
+			overrides: &ConfigOverrides{CurrentContext: "overridden-context"},
+			icc: &testICC{
+				possible: true,
+				testClientConfig: testClientConfig{
+					namespace:          "icc",
+					namespaceSpecified: false, // a namespace that comes from icc is not considered overridden
+				},
+			},
+			checkedICC: true,
+			result:     "default",
+			overridden: false, // a namespace that comes from a context is not considered overridden
 		},
 	}
 
 	for name, test := range testCases {
-		c := &DeferredLoadingClientConfig{icc: test.icc}
-		c.clientConfig = test.clientConfig
+		t.Run(name, func(t *testing.T) {
+			c := &DeferredLoadingClientConfig{icc: test.icc, overrides: test.overrides}
+			c.clientConfig = test.clientConfig
 
-		ns, ok, err := c.Namespace()
-		if test.icc.called != test.checkedICC {
-			t.Errorf("%s: unexpected in-cluster-config call %t", name, test.icc.called)
-		}
-		if err != test.err || ns != test.result || ok != test.ok {
-			t.Errorf("%s: unexpected result: %v %s %t", name, err, ns, ok)
-		}
+			ns, overridden, err := c.Namespace()
+			if test.icc.called != test.checkedICC {
+				t.Errorf("%s: unexpected in-cluster-config call %t", name, test.icc.called)
+			}
+			if err != test.err || ns != test.result || overridden != test.overridden {
+				t.Errorf("%s: unexpected result: %v %s %t", name, err, ns, overridden)
+			}
+		})
 	}
 }

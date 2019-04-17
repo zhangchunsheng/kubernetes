@@ -17,17 +17,18 @@ limitations under the License.
 package abac
 
 import (
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/runtime/schema"
-	"k8s.io/kubernetes/pkg/runtime/serializer"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 )
 
-// Group is the API group for abac
+// GroupName is the API group for abac
 const GroupName = "abac.authorization.kubernetes.io"
 
+// SchemeGroupVersion is the API group version used to register abac internal
 var SchemeGroupVersion = schema.GroupVersion{Group: GroupName, Version: runtime.APIVersionInternal}
 
-// Scheme is the default instance of runtime.Scheme to which types in the abac API group are registered.
+// Scheme is the default instance of runtime.Scheme to which types in the abac API group are api.Registry.
 // TODO: remove this, abac should not have its own scheme.
 var Scheme = runtime.NewScheme()
 
@@ -40,8 +41,10 @@ func init() {
 }
 
 var (
+	// SchemeBuilder is the scheme builder with scheme init functions to run for this API package
 	SchemeBuilder = runtime.NewSchemeBuilder(addKnownTypes)
-	AddToScheme   = SchemeBuilder.AddToScheme
+	// AddToScheme is a common registration function for mapping packaged scoped group & version keys to a scheme
+	AddToScheme = SchemeBuilder.AddToScheme
 )
 
 func addKnownTypes(scheme *runtime.Scheme) error {
@@ -50,5 +53,3 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 	)
 	return nil
 }
-
-func (obj *Policy) GetObjectKind() schema.ObjectKind { return &obj.TypeMeta }

@@ -17,26 +17,33 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"fmt"
 	"time"
 
-	"k8s.io/kubernetes/pkg/api"
-	apierrors "k8s.io/kubernetes/pkg/api/errors"
-	"k8s.io/kubernetes/pkg/api/v1"
-	metav1 "k8s.io/kubernetes/pkg/apis/meta/v1"
-	"k8s.io/kubernetes/pkg/client/cache"
-	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/clientset"
-	v1core "k8s.io/kubernetes/pkg/client/clientset_generated/clientset/typed/core/v1"
-	"k8s.io/kubernetes/pkg/client/restclient"
-	"k8s.io/kubernetes/pkg/fields"
-	"k8s.io/kubernetes/pkg/runtime"
+	v1authenticationapi "k8s.io/api/authentication/v1"
+	"k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
+	apiserverserviceaccount "k8s.io/apiserver/pkg/authentication/serviceaccount"
+	clientset "k8s.io/client-go/kubernetes"
+	v1authentication "k8s.io/client-go/kubernetes/typed/authentication/v1"
+	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
+	restclient "k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
+	watchtools "k8s.io/client-go/tools/watch"
+	"k8s.io/klog"
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
+	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/serviceaccount"
-	"k8s.io/kubernetes/pkg/watch"
-
-	"github.com/golang/glog"
 )
 
-// ControllerClientBuilder allow syou to get clients and configs for controllers
+// ControllerClientBuilder allows you to get clients and configs for controllers
+// Please note a copy also exists in staging/src/k8s.io/cloud-provider/cloud.go
+// TODO: Extract this into a separate controller utilities repo (issues/68947)
 type ControllerClientBuilder interface {
 	Config(name string) (*restclient.Config, error)
 	ConfigOrDie(name string) *restclient.Config
@@ -58,7 +65,7 @@ func (b SimpleControllerClientBuilder) Config(name string) (*restclient.Config, 
 func (b SimpleControllerClientBuilder) ConfigOrDie(name string) *restclient.Config {
 	clientConfig, err := b.Config(name)
 	if err != nil {
-		glog.Fatal(err)
+		klog.Fatal(err)
 	}
 	return clientConfig
 }
@@ -74,7 +81,7 @@ func (b SimpleControllerClientBuilder) Client(name string) (clientset.Interface,
 func (b SimpleControllerClientBuilder) ClientOrDie(name string) clientset.Interface {
 	client, err := b.Client(name)
 	if err != nil {
-		glog.Fatal(err)
+		klog.Fatal(err)
 	}
 	return client
 }
@@ -89,6 +96,10 @@ type SAControllerClientBuilder struct {
 	// to construct a controller client
 	CoreClient v1core.CoreV1Interface
 
+	// AuthenticationClient is used to check API tokens to make sure they are valid before
+	// building a controller client from them
+	AuthenticationClient v1authentication.AuthenticationV1Interface
+
 	// Namespace is the namespace used to host the service accounts that will back the
 	// controllers.  It must be highly privileged namespace which normal users cannot inspect.
 	Namespace string
@@ -97,40 +108,28 @@ type SAControllerClientBuilder struct {
 // config returns a complete clientConfig for constructing clients.  This is separate in anticipation of composition
 // which means that not all clientsets are known here
 func (b SAControllerClientBuilder) Config(name string) (*restclient.Config, error) {
-	clientConfig := restclient.AnonymousClientConfig(b.ClientConfig)
-
-	// we need the SA UID to find a matching SA token
-	sa, err := b.CoreClient.ServiceAccounts(b.Namespace).Get(name, metav1.GetOptions{})
-	if err != nil && !apierrors.IsNotFound(err) {
+	sa, err := getOrCreateServiceAccount(b.CoreClient, b.Namespace, name)
+	if err != nil {
 		return nil, err
-	} else if apierrors.IsNotFound(err) {
-		// check to see if the namespace exists.  If it isn't a NotFound, just try to create the SA.
-		// It'll probably fail, but perhaps that will have a better message.
-		if _, err := b.CoreClient.Namespaces().Get(b.Namespace, metav1.GetOptions{}); apierrors.IsNotFound(err) {
-			_, err = b.CoreClient.Namespaces().Create(&v1.Namespace{ObjectMeta: v1.ObjectMeta{Name: b.Namespace}})
-			if err != nil && !apierrors.IsAlreadyExists(err) {
-				return nil, err
-			}
-		}
-
-		sa, err = b.CoreClient.ServiceAccounts(b.Namespace).Create(
-			&v1.ServiceAccount{ObjectMeta: v1.ObjectMeta{Namespace: b.Namespace, Name: name}})
-		if err != nil {
-			return nil, err
-		}
 	}
 
+	var clientConfig *restclient.Config
+	fieldSelector := fields.SelectorFromSet(map[string]string{
+		api.SecretTypeField: string(v1.SecretTypeServiceAccountToken),
+	}).String()
 	lw := &cache.ListWatch{
-		ListFunc: func(options v1.ListOptions) (runtime.Object, error) {
-			options.FieldSelector = fields.SelectorFromSet(map[string]string{api.SecretTypeField: string(v1.SecretTypeServiceAccountToken)}).String()
+		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+			options.FieldSelector = fieldSelector
 			return b.CoreClient.Secrets(b.Namespace).List(options)
 		},
-		WatchFunc: func(options v1.ListOptions) (watch.Interface, error) {
-			options.FieldSelector = fields.SelectorFromSet(map[string]string{api.SecretTypeField: string(v1.SecretTypeServiceAccountToken)}).String()
+		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+			options.FieldSelector = fieldSelector
 			return b.CoreClient.Secrets(b.Namespace).Watch(options)
 		},
 	}
-	_, err = cache.ListWatchUntil(30*time.Second, lw,
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, err = watchtools.UntilWithSync(ctx, lw, &v1.Secret{}, nil,
 		func(event watch.Event) (bool, error) {
 			switch event.Type {
 			case watch.Deleted:
@@ -139,14 +138,32 @@ func (b SAControllerClientBuilder) Config(name string) (*restclient.Config, erro
 				return false, fmt.Errorf("error watching")
 
 			case watch.Added, watch.Modified:
-				secret := event.Object.(*v1.Secret)
-				if !serviceaccount.IsServiceAccountToken(secret, sa) ||
-					len(secret.Data[v1.ServiceAccountTokenKey]) == 0 {
+				secret, ok := event.Object.(*v1.Secret)
+				if !ok {
+					return false, fmt.Errorf("unexpected object type: %T", event.Object)
+				}
+				if !serviceaccount.IsServiceAccountToken(secret, sa) {
 					return false, nil
 				}
-				// TODO maybe verify the token is valid
-				clientConfig.BearerToken = string(secret.Data[v1.ServiceAccountTokenKey])
-				restclient.AddUserAgent(clientConfig, serviceaccount.MakeUsername(b.Namespace, name))
+				if len(secret.Data[v1.ServiceAccountTokenKey]) == 0 {
+					return false, nil
+				}
+				validConfig, valid, err := b.getAuthenticatedConfig(sa, string(secret.Data[v1.ServiceAccountTokenKey]))
+				if err != nil {
+					klog.Warningf("error validating API token for %s/%s in secret %s: %v", sa.Namespace, sa.Name, secret.Name, err)
+					// continue watching for good tokens
+					return false, nil
+				}
+				if !valid {
+					klog.Warningf("secret %s contained an invalid API token for %s/%s", secret.Name, sa.Namespace, sa.Name)
+					// try to delete the secret containing the invalid token
+					if err := b.CoreClient.Secrets(secret.Namespace).Delete(secret.Name, &metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+						klog.Warningf("error deleting secret %s containing invalid API token for %s/%s: %v", secret.Name, sa.Namespace, sa.Name, err)
+					}
+					// continue watching for good tokens
+					return false, nil
+				}
+				clientConfig = validConfig
 				return true, nil
 
 			default:
@@ -160,10 +177,49 @@ func (b SAControllerClientBuilder) Config(name string) (*restclient.Config, erro
 	return clientConfig, nil
 }
 
+func (b SAControllerClientBuilder) getAuthenticatedConfig(sa *v1.ServiceAccount, token string) (*restclient.Config, bool, error) {
+	username := apiserverserviceaccount.MakeUsername(sa.Namespace, sa.Name)
+
+	clientConfig := restclient.AnonymousClientConfig(b.ClientConfig)
+	clientConfig.BearerToken = token
+	restclient.AddUserAgent(clientConfig, username)
+
+	// Try token review first
+	tokenReview := &v1authenticationapi.TokenReview{Spec: v1authenticationapi.TokenReviewSpec{Token: token}}
+	if tokenResult, err := b.AuthenticationClient.TokenReviews().Create(tokenReview); err == nil {
+		if !tokenResult.Status.Authenticated {
+			klog.Warningf("Token for %s/%s did not authenticate correctly", sa.Namespace, sa.Name)
+			return nil, false, nil
+		}
+		if tokenResult.Status.User.Username != username {
+			klog.Warningf("Token for %s/%s authenticated as unexpected username: %s", sa.Namespace, sa.Name, tokenResult.Status.User.Username)
+			return nil, false, nil
+		}
+		klog.V(4).Infof("Verified credential for %s/%s", sa.Namespace, sa.Name)
+		return clientConfig, true, nil
+	}
+
+	// If we couldn't run the token review, the API might be disabled or we might not have permission.
+	// Try to make a request to /apis with the token. If we get a 401 we should consider the token invalid.
+	clientConfigCopy := *clientConfig
+	clientConfigCopy.NegotiatedSerializer = legacyscheme.Codecs
+	client, err := restclient.UnversionedRESTClientFor(&clientConfigCopy)
+	if err != nil {
+		return nil, false, err
+	}
+	err = client.Get().AbsPath("/apis").Do().Error()
+	if apierrors.IsUnauthorized(err) {
+		klog.Warningf("Token for %s/%s did not authenticate correctly: %v", sa.Namespace, sa.Name, err)
+		return nil, false, nil
+	}
+
+	return clientConfig, true, nil
+}
+
 func (b SAControllerClientBuilder) ConfigOrDie(name string) *restclient.Config {
 	clientConfig, err := b.Config(name)
 	if err != nil {
-		glog.Fatal(err)
+		klog.Fatal(err)
 	}
 	return clientConfig
 }
@@ -179,7 +235,7 @@ func (b SAControllerClientBuilder) Client(name string) (clientset.Interface, err
 func (b SAControllerClientBuilder) ClientOrDie(name string) clientset.Interface {
 	client, err := b.Client(name)
 	if err != nil {
-		glog.Fatal(err)
+		klog.Fatal(err)
 	}
 	return client
 }

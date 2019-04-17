@@ -21,8 +21,8 @@ import (
 	"fmt"
 	"reflect"
 
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/watch"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
 )
 
 // WatchEvent objects are streamed from the api server in response to a watch request.
@@ -32,7 +32,7 @@ import (
 type WatchEvent struct {
 	// The type of the watch event; added, modified, deleted, or error.
 	// +optional
-	Type watch.EventType `json:"type,omitempty" description:"the type of watch event; may be ADDED, MODIFIED, DELETED, or ERROR"`
+	Type watch.EventType `json:"type,omitempty" description:"the type of watch event; may be ADDED, MODIFIED, DELETED, BOOKMARK or ERROR"`
 
 	// For added or modified objects, this is the new object; for deleted objects,
 	// it's the state of the object immediately prior to its deletion.

@@ -18,6 +18,7 @@ package e2e_node
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -26,21 +27,22 @@ import (
 	"strconv"
 	"strings"
 
-	"k8s.io/kubernetes/pkg/api/errors"
-	"k8s.io/kubernetes/pkg/api/v1"
-	metav1 "k8s.io/kubernetes/pkg/apis/meta/v1"
-	"k8s.io/kubernetes/pkg/runtime/schema"
+	"k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/watch"
+	watchtools "k8s.io/client-go/tools/watch"
 	"k8s.io/kubernetes/pkg/security/apparmor"
-	"k8s.io/kubernetes/pkg/watch"
 	"k8s.io/kubernetes/test/e2e/framework"
 
 	"github.com/davecgh/go-spew/spew"
-	"github.com/golang/glog"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+	"k8s.io/klog"
 )
 
-var _ = framework.KubeDescribe("AppArmor [Feature:AppArmor]", func() {
+var _ = framework.KubeDescribe("AppArmor [Feature:AppArmor][NodeFeature:AppArmor]", func() {
 	if isAppArmorEnabled() {
 		BeforeEach(func() {
 			By("Loading AppArmor profiles for testing")
@@ -50,7 +52,7 @@ var _ = framework.KubeDescribe("AppArmor [Feature:AppArmor]", func() {
 			f := framework.NewDefaultFramework("apparmor-test")
 
 			It("should reject an unloaded profile", func() {
-				status := runAppArmorTest(f, false, apparmor.ProfileNamePrefix+"non-existant-profile")
+				status := runAppArmorTest(f, false, apparmor.ProfileNamePrefix+"non-existent-profile")
 				expectSoftRejection(status)
 			})
 			It("should enforce a profile blocking writes", func() {
@@ -60,6 +62,7 @@ var _ = framework.KubeDescribe("AppArmor [Feature:AppArmor]", func() {
 					return
 				}
 				state := status.ContainerStatuses[0].State.Terminated
+				Expect(state).ToNot(BeNil(), "ContainerState: %+v", status.ContainerStatuses[0].State)
 				Expect(state.ExitCode).To(Not(BeZero()), "ContainerStateTerminated: %+v", state)
 
 			})
@@ -70,6 +73,7 @@ var _ = framework.KubeDescribe("AppArmor [Feature:AppArmor]", func() {
 					return
 				}
 				state := status.ContainerStatuses[0].State.Terminated
+				Expect(state).ToNot(BeNil(), "ContainerState: %+v", status.ContainerStatuses[0].State)
 				Expect(state.ExitCode).To(BeZero(), "ContainerStateTerminated: %+v", state)
 			})
 		})
@@ -128,14 +132,14 @@ func loadTestProfiles() error {
 	// apparmor_parser does not always return an error code, so consider any stderr output an error.
 	if err != nil || stderr.Len() > 0 {
 		if stderr.Len() > 0 {
-			glog.Warning(stderr.String())
+			klog.Warning(stderr.String())
 		}
 		if len(out) > 0 {
-			glog.Infof("apparmor_parser: %s", out)
+			klog.Infof("apparmor_parser: %s", out)
 		}
 		return fmt.Errorf("failed to load profiles: %v", err)
 	}
-	glog.V(2).Infof("Loaded profiles: %v", out)
+	klog.V(2).Infof("Loaded profiles: %v", out)
 	return nil
 }
 
@@ -144,12 +148,14 @@ func runAppArmorTest(f *framework.Framework, shouldRun bool, profile string) v1.
 	if shouldRun {
 		// The pod needs to start before it stops, so wait for the longer start timeout.
 		framework.ExpectNoError(framework.WaitTimeoutForPodNoLongerRunningInNamespace(
-			f.ClientSet, pod.Name, f.Namespace.Name, "", framework.PodStartTimeout))
+			f.ClientSet, pod.Name, f.Namespace.Name, framework.PodStartTimeout))
 	} else {
 		// Pod should remain in the pending state. Wait for the Reason to be set to "AppArmor".
-		w, err := f.PodClient().Watch(v1.SingleObject(v1.ObjectMeta{Name: pod.Name}))
+		w, err := f.PodClient().Watch(metav1.SingleObject(metav1.ObjectMeta{Name: pod.Name}))
 		framework.ExpectNoError(err)
-		_, err = watch.Until(framework.PodStartTimeout, w, func(e watch.Event) (bool, error) {
+		ctx, cancel := watchtools.ContextWithOptionalTimeout(context.Background(), framework.PodStartTimeout)
+		defer cancel()
+		_, err = watchtools.UntilWithoutRetry(ctx, w, func(e watch.Event) (bool, error) {
 			switch e.Type {
 			case watch.Deleted:
 				return false, errors.NewNotFound(schema.GroupResource{Resource: "pods"}, pod.Name)
@@ -171,7 +177,7 @@ func runAppArmorTest(f *framework.Framework, shouldRun bool, profile string) v1.
 
 func createPodWithAppArmor(f *framework.Framework, profile string) *v1.Pod {
 	pod := &v1.Pod{
-		ObjectMeta: v1.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name: fmt.Sprintf("test-apparmor-%s", strings.Replace(profile, "/", "-", -1)),
 			Annotations: map[string]string{
 				apparmor.ContainerAnnotationKeyPrefix + "test": profile,
@@ -180,7 +186,7 @@ func createPodWithAppArmor(f *framework.Framework, profile string) *v1.Pod {
 		Spec: v1.PodSpec{
 			Containers: []v1.Container{{
 				Name:    "test",
-				Image:   "gcr.io/google_containers/busybox:1.24",
+				Image:   busyboxImage,
 				Command: []string{"touch", "foo"},
 			}},
 			RestartPolicy: v1.RestartPolicyNever,
@@ -198,14 +204,14 @@ func expectSoftRejection(status v1.PodStatus) {
 }
 
 func isAppArmorEnabled() bool {
-	// TODO(timstclair): Pass this through the image setup rather than hardcoding.
+	// TODO(tallclair): Pass this through the image setup rather than hardcoding.
 	if strings.Contains(framework.TestContext.NodeName, "-gci-dev-") {
 		gciVersionRe := regexp.MustCompile("-gci-dev-([0-9]+)-")
 		matches := gciVersionRe.FindStringSubmatch(framework.TestContext.NodeName)
 		if len(matches) == 2 {
 			version, err := strconv.Atoi(matches[1])
 			if err != nil {
-				glog.Errorf("Error parsing GCI version from NodeName %q: %v", framework.TestContext.NodeName, err)
+				klog.Errorf("Error parsing GCI version from NodeName %q: %v", framework.TestContext.NodeName, err)
 				return false
 			}
 			return version >= 54

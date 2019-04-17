@@ -17,37 +17,47 @@ limitations under the License.
 package common
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"time"
 
-	"k8s.io/kubernetes/pkg/api/resource"
-	"k8s.io/kubernetes/pkg/api/v1"
+	"k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/uuid"
+	"k8s.io/apimachinery/pkg/watch"
+	watchtools "k8s.io/client-go/tools/watch"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/kubernetes/pkg/client/conditions"
-	"k8s.io/kubernetes/pkg/util/uuid"
-	"k8s.io/kubernetes/pkg/watch"
 	"k8s.io/kubernetes/test/e2e/framework"
+	imageutils "k8s.io/kubernetes/test/utils/image"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
 
-var _ = framework.KubeDescribe("InitContainer", func() {
+var _ = framework.KubeDescribe("InitContainer [NodeConformance]", func() {
 	f := framework.NewDefaultFramework("init-container")
 	var podClient *framework.PodClient
 	BeforeEach(func() {
 		podClient = f.PodClient()
 	})
 
-	It("should invoke init containers on a RestartNever pod", func() {
-		framework.SkipIfContainerRuntimeIs("rkt") // #25988
-
+	/*
+		Release: v1.12
+		Testname: init-container-starts-app-restartnever-pod
+		Description: Ensure that all InitContainers are started
+		and all containers in pod are voluntarily terminated with exit status 0,
+		and the system is not going to restart any of these containers
+		when Pod has restart policy as RestartNever.
+	*/
+	framework.ConformanceIt("should invoke init containers on a RestartNever pod", func() {
 		By("creating the pod")
 		name := "pod-init-" + string(uuid.NewUUID())
 		value := strconv.Itoa(time.Now().Nanosecond())
 		pod := &v1.Pod{
-			ObjectMeta: v1.ObjectMeta{
+			ObjectMeta: metav1.ObjectMeta{
 				Name: name,
 				Labels: map[string]string{
 					"name": "foo",
@@ -59,41 +69,37 @@ var _ = framework.KubeDescribe("InitContainer", func() {
 				InitContainers: []v1.Container{
 					{
 						Name:    "init1",
-						Image:   "gcr.io/google_containers/busybox:1.24",
+						Image:   imageutils.GetE2EImage(imageutils.BusyBox),
 						Command: []string{"/bin/true"},
 					},
 					{
 						Name:    "init2",
-						Image:   "gcr.io/google_containers/busybox:1.24",
+						Image:   imageutils.GetE2EImage(imageutils.BusyBox),
 						Command: []string{"/bin/true"},
 					},
 				},
 				Containers: []v1.Container{
 					{
 						Name:    "run1",
-						Image:   "gcr.io/google_containers/busybox:1.24",
+						Image:   imageutils.GetE2EImage(imageutils.BusyBox),
 						Command: []string{"/bin/true"},
 					},
 				},
 			},
 		}
-		if err := podutil.SetInitContainersAnnotations(pod); err != nil {
-			Expect(err).To(BeNil())
-		}
+		framework.Logf("PodSpec: initContainers in spec.initContainers")
 		startedPod := podClient.Create(pod)
-		w, err := podClient.Watch(v1.SingleObject(startedPod.ObjectMeta))
+		w, err := podClient.Watch(metav1.SingleObject(startedPod.ObjectMeta))
 		Expect(err).NotTo(HaveOccurred(), "error watching a pod")
 		wr := watch.NewRecorder(w)
-		event, err := watch.Until(framework.PodStartTimeout, wr, conditions.PodCompleted)
+		ctx, cancel := watchtools.ContextWithOptionalTimeout(context.Background(), framework.PodStartTimeout)
+		defer cancel()
+		event, err := watchtools.UntilWithoutRetry(ctx, wr, conditions.PodCompleted)
 		Expect(err).To(BeNil())
 		framework.CheckInvariants(wr.Events(), framework.ContainerInitInvariant)
 		endPod := event.Object.(*v1.Pod)
-		if err := podutil.SetInitContainersAndStatuses(endPod); err != nil {
-			Expect(err).To(BeNil())
-		}
-
 		Expect(endPod.Status.Phase).To(Equal(v1.PodSucceeded))
-		_, init := v1.GetPodCondition(&endPod.Status, v1.PodInitialized)
+		_, init := podutil.GetPodCondition(&endPod.Status, v1.PodInitialized)
 		Expect(init).NotTo(BeNil())
 		Expect(init.Status).To(Equal(v1.ConditionTrue))
 
@@ -105,14 +111,20 @@ var _ = framework.KubeDescribe("InitContainer", func() {
 		}
 	})
 
-	It("should invoke init containers on a RestartAlways pod", func() {
-		framework.SkipIfContainerRuntimeIs("rkt") // #25988
-
+	/*
+		Release: v1.12
+		Testname: init-container-starts-app-restartalways-pod
+		Description: Ensure that all InitContainers are started
+		and all containers in pod started
+		and at least one container is still running or is in the process of being restarted
+		when Pod has restart policy as RestartAlways.
+	*/
+	framework.ConformanceIt("should invoke init containers on a RestartAlways pod", func() {
 		By("creating the pod")
 		name := "pod-init-" + string(uuid.NewUUID())
 		value := strconv.Itoa(time.Now().Nanosecond())
 		pod := &v1.Pod{
-			ObjectMeta: v1.ObjectMeta{
+			ObjectMeta: metav1.ObjectMeta{
 				Name: name,
 				Labels: map[string]string{
 					"name": "foo",
@@ -123,48 +135,44 @@ var _ = framework.KubeDescribe("InitContainer", func() {
 				InitContainers: []v1.Container{
 					{
 						Name:    "init1",
-						Image:   "gcr.io/google_containers/busybox:1.24",
+						Image:   imageutils.GetE2EImage(imageutils.BusyBox),
 						Command: []string{"/bin/true"},
 					},
 					{
 						Name:    "init2",
-						Image:   "gcr.io/google_containers/busybox:1.24",
+						Image:   imageutils.GetE2EImage(imageutils.BusyBox),
 						Command: []string{"/bin/true"},
 					},
 				},
 				Containers: []v1.Container{
 					{
 						Name:  "run1",
-						Image: framework.GetPauseImageName(f.ClientSet),
+						Image: imageutils.GetPauseImageName(),
 						Resources: v1.ResourceRequirements{
 							Limits: v1.ResourceList{
 								v1.ResourceCPU:    *resource.NewMilliQuantity(100, resource.DecimalSI),
-								v1.ResourceMemory: *resource.NewQuantity(30*1024*1024, resource.DecimalSI),
+								v1.ResourceMemory: *resource.NewQuantity(50*1024*1024, resource.DecimalSI),
 							},
 						},
 					},
 				},
 			},
 		}
-		if err := podutil.SetInitContainersAnnotations(pod); err != nil {
-			Expect(err).To(BeNil())
-		}
+		framework.Logf("PodSpec: initContainers in spec.initContainers")
 		startedPod := podClient.Create(pod)
-		w, err := podClient.Watch(v1.SingleObject(startedPod.ObjectMeta))
+		w, err := podClient.Watch(metav1.SingleObject(startedPod.ObjectMeta))
 		Expect(err).NotTo(HaveOccurred(), "error watching a pod")
 		wr := watch.NewRecorder(w)
-		event, err := watch.Until(framework.PodStartTimeout, wr, conditions.PodRunning)
+		ctx, cancel := watchtools.ContextWithOptionalTimeout(context.Background(), framework.PodStartTimeout)
+		defer cancel()
+		event, err := watchtools.UntilWithoutRetry(ctx, wr, conditions.PodRunning)
 		Expect(err).To(BeNil())
 		framework.CheckInvariants(wr.Events(), framework.ContainerInitInvariant)
 		endPod := event.Object.(*v1.Pod)
-
 		Expect(endPod.Status.Phase).To(Equal(v1.PodRunning))
-		_, init := v1.GetPodCondition(&endPod.Status, v1.PodInitialized)
+		_, init := podutil.GetPodCondition(&endPod.Status, v1.PodInitialized)
 		Expect(init).NotTo(BeNil())
 		Expect(init.Status).To(Equal(v1.ConditionTrue))
-		if err := podutil.SetInitContainersAndStatuses(endPod); err != nil {
-			Expect(err).To(BeNil())
-		}
 
 		Expect(len(endPod.Status.InitContainerStatuses)).To(Equal(2))
 		for _, status := range endPod.Status.InitContainerStatuses {
@@ -174,15 +182,21 @@ var _ = framework.KubeDescribe("InitContainer", func() {
 		}
 	})
 
-	It("should not start app containers if init containers fail on a RestartAlways pod", func() {
-		framework.SkipIfContainerRuntimeIs("rkt") // #25988
-
+	/*
+		Release: v1.12
+		Testname: init-container-fails-stops-app-restartalways-pod
+		Description: Ensure that app container is not started
+		when all InitContainers failed to start
+		and Pod has restarted for few occurrences
+		and pod has restart policy as RestartAlways.
+	*/
+	framework.ConformanceIt("should not start app containers if init containers fail on a RestartAlways pod", func() {
 		By("creating the pod")
 		name := "pod-init-" + string(uuid.NewUUID())
 		value := strconv.Itoa(time.Now().Nanosecond())
 
 		pod := &v1.Pod{
-			ObjectMeta: v1.ObjectMeta{
+			ObjectMeta: metav1.ObjectMeta{
 				Name: name,
 				Labels: map[string]string{
 					"name": "foo",
@@ -193,46 +207,43 @@ var _ = framework.KubeDescribe("InitContainer", func() {
 				InitContainers: []v1.Container{
 					{
 						Name:    "init1",
-						Image:   "gcr.io/google_containers/busybox:1.24",
+						Image:   imageutils.GetE2EImage(imageutils.BusyBox),
 						Command: []string{"/bin/false"},
 					},
 					{
 						Name:    "init2",
-						Image:   "gcr.io/google_containers/busybox:1.24",
+						Image:   imageutils.GetE2EImage(imageutils.BusyBox),
 						Command: []string{"/bin/true"},
 					},
 				},
 				Containers: []v1.Container{
 					{
 						Name:  "run1",
-						Image: framework.GetPauseImageName(f.ClientSet),
+						Image: imageutils.GetPauseImageName(),
 						Resources: v1.ResourceRequirements{
 							Limits: v1.ResourceList{
 								v1.ResourceCPU:    *resource.NewMilliQuantity(100, resource.DecimalSI),
-								v1.ResourceMemory: *resource.NewQuantity(30*1024*1024, resource.DecimalSI),
+								v1.ResourceMemory: *resource.NewQuantity(50*1024*1024, resource.DecimalSI),
 							},
 						},
 					},
 				},
 			},
 		}
-		if err := podutil.SetInitContainersAnnotations(pod); err != nil {
-			Expect(err).To(BeNil())
-		}
+		framework.Logf("PodSpec: initContainers in spec.initContainers")
 		startedPod := podClient.Create(pod)
-		w, err := podClient.Watch(v1.SingleObject(startedPod.ObjectMeta))
+		w, err := podClient.Watch(metav1.SingleObject(startedPod.ObjectMeta))
 		Expect(err).NotTo(HaveOccurred(), "error watching a pod")
 
 		wr := watch.NewRecorder(w)
-		event, err := watch.Until(
-			framework.PodStartTimeout, wr,
+		ctx, cancel := watchtools.ContextWithOptionalTimeout(context.Background(), framework.PodStartTimeout)
+		defer cancel()
+		event, err := watchtools.UntilWithoutRetry(
+			ctx, wr,
 			// check for the first container to fail at least once
 			func(evt watch.Event) (bool, error) {
 				switch t := evt.Object.(type) {
 				case *v1.Pod:
-					if err := podutil.SetInitContainersAndStatuses(t); err != nil {
-						Expect(err).To(BeNil())
-					}
 					for _, status := range t.Status.ContainerStatuses {
 						if status.State.Waiting == nil {
 							return false, fmt.Errorf("container %q should not be out of waiting: %#v", status.Name, status)
@@ -265,9 +276,6 @@ var _ = framework.KubeDescribe("InitContainer", func() {
 			func(evt watch.Event) (bool, error) {
 				switch t := evt.Object.(type) {
 				case *v1.Pod:
-					if err := podutil.SetInitContainersAndStatuses(t); err != nil {
-						Expect(err).To(BeNil())
-					}
 					status := t.Status.InitContainerStatuses[0]
 					if status.RestartCount < 3 {
 						return false, nil
@@ -283,12 +291,8 @@ var _ = framework.KubeDescribe("InitContainer", func() {
 		Expect(err).To(BeNil())
 		framework.CheckInvariants(wr.Events(), framework.ContainerInitInvariant)
 		endPod := event.Object.(*v1.Pod)
-		if err := podutil.SetInitContainersAndStatuses(endPod); err != nil {
-			Expect(err).To(BeNil())
-		}
-
 		Expect(endPod.Status.Phase).To(Equal(v1.PodPending))
-		_, init := v1.GetPodCondition(&endPod.Status, v1.PodInitialized)
+		_, init := podutil.GetPodCondition(&endPod.Status, v1.PodInitialized)
 		Expect(init).NotTo(BeNil())
 		Expect(init.Status).To(Equal(v1.ConditionFalse))
 		Expect(init.Reason).To(Equal("ContainersNotInitialized"))
@@ -296,14 +300,18 @@ var _ = framework.KubeDescribe("InitContainer", func() {
 		Expect(len(endPod.Status.InitContainerStatuses)).To(Equal(2))
 	})
 
-	It("should not start app containers and fail the pod if init containers fail on a RestartNever pod", func() {
-		framework.SkipIfContainerRuntimeIs("rkt") // #25988
-
+	/*
+		Release: v1.12
+		Testname: init-container-fails-stops-app-restartnever-pod
+		Description: Ensure that app container is not started
+		when at least one InitContainer fails to start and Pod has restart policy as RestartNever.
+	*/
+	framework.ConformanceIt("should not start app containers and fail the pod if init containers fail on a RestartNever pod", func() {
 		By("creating the pod")
 		name := "pod-init-" + string(uuid.NewUUID())
 		value := strconv.Itoa(time.Now().Nanosecond())
 		pod := &v1.Pod{
-			ObjectMeta: v1.ObjectMeta{
+			ObjectMeta: metav1.ObjectMeta{
 				Name: name,
 				Labels: map[string]string{
 					"name": "foo",
@@ -315,48 +323,45 @@ var _ = framework.KubeDescribe("InitContainer", func() {
 				InitContainers: []v1.Container{
 					{
 						Name:    "init1",
-						Image:   "gcr.io/google_containers/busybox:1.24",
+						Image:   imageutils.GetE2EImage(imageutils.BusyBox),
 						Command: []string{"/bin/true"},
 					},
 					{
 						Name:    "init2",
-						Image:   "gcr.io/google_containers/busybox:1.24",
+						Image:   imageutils.GetE2EImage(imageutils.BusyBox),
 						Command: []string{"/bin/false"},
 					},
 				},
 				Containers: []v1.Container{
 					{
 						Name:    "run1",
-						Image:   "gcr.io/google_containers/busybox:1.24",
+						Image:   imageutils.GetE2EImage(imageutils.BusyBox),
 						Command: []string{"/bin/true"},
 						Resources: v1.ResourceRequirements{
 							Limits: v1.ResourceList{
 								v1.ResourceCPU:    *resource.NewMilliQuantity(100, resource.DecimalSI),
-								v1.ResourceMemory: *resource.NewQuantity(30*1024*1024, resource.DecimalSI),
+								v1.ResourceMemory: *resource.NewQuantity(50*1024*1024, resource.DecimalSI),
 							},
 						},
 					},
 				},
 			},
 		}
-		if err := podutil.SetInitContainersAnnotations(pod); err != nil {
-			Expect(err).To(BeNil())
-		}
+		framework.Logf("PodSpec: initContainers in spec.initContainers")
 		startedPod := podClient.Create(pod)
 
-		w, err := podClient.Watch(v1.SingleObject(startedPod.ObjectMeta))
+		w, err := podClient.Watch(metav1.SingleObject(startedPod.ObjectMeta))
 		Expect(err).NotTo(HaveOccurred(), "error watching a pod")
 
 		wr := watch.NewRecorder(w)
-		event, err := watch.Until(
-			framework.PodStartTimeout, wr,
+		ctx, cancel := watchtools.ContextWithOptionalTimeout(context.Background(), framework.PodStartTimeout)
+		defer cancel()
+		event, err := watchtools.UntilWithoutRetry(
+			ctx, wr,
 			// check for the second container to fail at least once
 			func(evt watch.Event) (bool, error) {
 				switch t := evt.Object.(type) {
 				case *v1.Pod:
-					if err := podutil.SetInitContainersAndStatuses(t); err != nil {
-						Expect(err).To(BeNil())
-					}
 					for _, status := range t.Status.ContainerStatuses {
 						if status.State.Waiting == nil {
 							return false, fmt.Errorf("container %q should not be out of waiting: %#v", status.Name, status)
@@ -397,7 +402,7 @@ var _ = framework.KubeDescribe("InitContainer", func() {
 		endPod := event.Object.(*v1.Pod)
 
 		Expect(endPod.Status.Phase).To(Equal(v1.PodFailed))
-		_, init := v1.GetPodCondition(&endPod.Status, v1.PodInitialized)
+		_, init := podutil.GetPodCondition(&endPod.Status, v1.PodInitialized)
 		Expect(init).NotTo(BeNil())
 		Expect(init.Status).To(Equal(v1.ConditionFalse))
 		Expect(init.Reason).To(Equal("ContainersNotInitialized"))

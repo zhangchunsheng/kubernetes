@@ -1,3 +1,12 @@
-assignees:
+# See the OWNERS docs at https://go.k8s.io/owners
+
+approvers:
 - anguslees
-- dagnello
+- NickrenREN
+- dims
+- FengyunPan2
+reviewers:
+- anguslees
+- NickrenREN
+- dims
+- FengyunPan2

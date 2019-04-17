@@ -17,9 +17,12 @@ limitations under the License.
 package kubelet
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"time"
+
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 )
 
 type runtimeState struct {
@@ -27,9 +30,24 @@ type runtimeState struct {
 	lastBaseRuntimeSync      time.Time
 	baseRuntimeSyncThreshold time.Duration
 	networkError             error
-	internalError            error
+	storageError             error
 	cidr                     string
-	initError                error
+	healthChecks             []*healthCheck
+}
+
+// A health check function should be efficient and not rely on external
+// components (e.g., container runtime).
+type healthCheckFnType func() (bool, error)
+
+type healthCheck struct {
+	name string
+	fn   healthCheckFnType
+}
+
+func (s *runtimeState) addHealthCheck(name string, f healthCheckFnType) {
+	s.Lock()
+	defer s.Unlock()
+	s.healthChecks = append(s.healthChecks, &healthCheck{name: name, fn: f})
 }
 
 func (s *runtimeState) setRuntimeSync(t time.Time) {
@@ -38,16 +56,16 @@ func (s *runtimeState) setRuntimeSync(t time.Time) {
 	s.lastBaseRuntimeSync = t
 }
 
-func (s *runtimeState) setInternalError(err error) {
-	s.Lock()
-	defer s.Unlock()
-	s.internalError = err
-}
-
 func (s *runtimeState) setNetworkState(err error) {
 	s.Lock()
 	defer s.Unlock()
 	s.networkError = err
+}
+
+func (s *runtimeState) setStorageState(err error) {
+	s.Lock()
+	defer s.Unlock()
+	s.storageError = err
 }
 
 func (s *runtimeState) setPodCIDR(cidr string) {
@@ -62,36 +80,42 @@ func (s *runtimeState) podCIDR() string {
 	return s.cidr
 }
 
-func (s *runtimeState) setInitError(err error) {
-	s.Lock()
-	defer s.Unlock()
-	s.initError = err
-}
-
-func (s *runtimeState) runtimeErrors() []string {
+func (s *runtimeState) runtimeErrors() error {
 	s.RLock()
 	defer s.RUnlock()
-	var ret []string
-	if s.initError != nil {
-		ret = append(ret, s.initError.Error())
+	errs := []error{}
+	if s.lastBaseRuntimeSync.IsZero() {
+		errs = append(errs, errors.New("container runtime status check may not have completed yet."))
+	} else if !s.lastBaseRuntimeSync.Add(s.baseRuntimeSyncThreshold).After(time.Now()) {
+		errs = append(errs, errors.New("container runtime is down."))
 	}
-	if !s.lastBaseRuntimeSync.Add(s.baseRuntimeSyncThreshold).After(time.Now()) {
-		ret = append(ret, "container runtime is down")
+	for _, hc := range s.healthChecks {
+		if ok, err := hc.fn(); !ok {
+			errs = append(errs, fmt.Errorf("%s is not healthy: %v.", hc.name, err))
+		}
 	}
-	if s.internalError != nil {
-		ret = append(ret, s.internalError.Error())
-	}
-	return ret
+
+	return utilerrors.NewAggregate(errs)
 }
 
-func (s *runtimeState) networkErrors() []string {
+func (s *runtimeState) networkErrors() error {
 	s.RLock()
 	defer s.RUnlock()
-	var ret []string
+	errs := []error{}
 	if s.networkError != nil {
-		ret = append(ret, s.networkError.Error())
+		errs = append(errs, s.networkError)
 	}
-	return ret
+	return utilerrors.NewAggregate(errs)
+}
+
+func (s *runtimeState) storageErrors() error {
+	s.RLock()
+	defer s.RUnlock()
+	errs := []error{}
+	if s.storageError != nil {
+		errs = append(errs, s.storageError)
+	}
+	return utilerrors.NewAggregate(errs)
 }
 
 func newRuntimeState(
@@ -100,7 +124,6 @@ func newRuntimeState(
 	return &runtimeState{
 		lastBaseRuntimeSync:      time.Time{},
 		baseRuntimeSyncThreshold: runtimeSyncThreshold,
-		networkError:             fmt.Errorf("network state unknown"),
-		internalError:            nil,
+		networkError:             ErrNetworkUnknown,
 	}
 }
